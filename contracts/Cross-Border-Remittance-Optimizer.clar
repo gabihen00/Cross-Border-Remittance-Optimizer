@@ -22,6 +22,10 @@
 (define-constant LOYALTY-SILVER-THRESHOLD u15)
 (define-constant LOYALTY-GOLD-THRESHOLD u50)
 
+;; Routing optimization constants
+(define-constant MIN-SAVINGS-THRESHOLD u100) ;; 1% minimum savings to use routing (in basis points)
+(define-constant MAX-ROUTE-STEPS u3) ;; Maximum steps in routing path
+
 ;; Data Variables
 (define-data-var remittance-counter uint u0)
 (define-data-var total-volume uint u0)
@@ -56,6 +60,10 @@
 
 ;; Volume tracking for congestion analysis (block-height -> volume)
 (define-map block-volumes uint uint)
+
+;; Routing optimization tracking
+(define-map routing-savings principal uint)
+(define-map optimal-routes {from: (string-ascii 5), to: (string-ascii 5)} (list 3 (string-ascii 5)))
 
 ;; Exchange rate helpers
 (define-private (get-exchange-rate (from (string-ascii 5)) (to (string-ascii 5)))
@@ -139,6 +147,69 @@
     )
 )
 
+;; Calculate conversion through intermediate currency
+(define-private (calculate-route-conversion (amount uint) (currency1 (string-ascii 5)) (currency2 (string-ascii 5)) (currency3 (string-ascii 5)))
+    (let (
+        (rate1 (unwrap-panic (get-exchange-rate currency1 currency2)))
+        (rate2 (unwrap-panic (get-exchange-rate currency2 currency3)))
+        (intermediate-amount (/ (* amount rate1) u1000000))
+        (final-amount (/ (* intermediate-amount rate2) u1000000))
+    )
+        final-amount
+    )
+)
+
+;; Find optimal routing path
+(define-private (find-optimal-route (from (string-ascii 5)) (to (string-ascii 5)) (amount uint))
+    (let (
+        (direct-rate (unwrap-panic (get-exchange-rate from to)))
+        (direct-amount (/ (* amount direct-rate) u1000000))
+        (usd-route (if (and (not (is-eq from "USD")) (not (is-eq to "USD")))
+                      (some (calculate-route-conversion amount from "USD" to))
+                      none))
+        (eur-route (if (and (not (is-eq from "EUR")) (not (is-eq to "EUR")))
+                      (some (calculate-route-conversion amount from "EUR" to))
+                      none))
+        (gbp-route (if (and (not (is-eq from "GBP")) (not (is-eq to "GBP")))
+                      (some (calculate-route-conversion amount from "GBP" to))
+                      none))
+        (best-routed (fold max-amount-option (list usd-route eur-route gbp-route) none))
+    )
+        (match best-routed
+            some-amount (if (> some-amount (+ direct-amount (/ (* direct-amount MIN-SAVINGS-THRESHOLD) u10000)))
+                           {optimal: true, amount: some-amount, route: (get-route-path from to some-amount direct-amount)}
+                           {optimal: false, amount: direct-amount, route: (list from to)})
+            {optimal: false, amount: direct-amount, route: (list from to)}
+        )
+    )
+)
+
+;; Helper to find maximum amount option
+(define-private (max-amount-option (current (optional uint)) (best (optional uint)))
+    (match current
+        some-current (match best
+                        some-best (if (> some-current some-best) current best)
+                        current)
+        best)
+)
+
+;; Get route path based on best conversion
+(define-private (get-route-path (from (string-ascii 5)) (to (string-ascii 5)) (routed-amount uint) (direct-amount uint))
+    (let (
+        (usd-amount (calculate-route-conversion u1000000 from "USD" to))
+        (eur-amount (calculate-route-conversion u1000000 from "EUR" to))
+        (gbp-amount (calculate-route-conversion u1000000 from "GBP" to))
+    )
+        (if (is-eq routed-amount usd-amount)
+            (list from "USD" to)
+            (if (is-eq routed-amount eur-amount)
+                (list from "EUR" to)
+                (if (is-eq routed-amount gbp-amount)
+                    (list from "GBP" to)
+                    (list from to))))
+    )
+)
+
 ;; Public Functions
 
 ;; Register a new user
@@ -169,8 +240,9 @@
         (user tx-sender)
         (user-data (unwrap! (map-get? users user) ERR-USER-NOT-REGISTERED))
         (current-block stacks-block-height)
-        (exchange-rate (unwrap! (get-exchange-rate from-currency to-currency) ERR-INVALID-CURRENCY))
-        (converted-amount (/ (* amount exchange-rate) u1000000))
+        (routing-result (find-optimal-route from-currency to-currency amount))
+        (converted-amount (get amount routing-result))
+        (routing-used (get optimal routing-result))
         (fee (calculate-dynamic-fee amount user))
         (remittance-id (+ (var-get remittance-counter) u1))
     )
@@ -207,6 +279,20 @@
             created-at: current-block,
             claimed-at: none
         })
+        
+        ;; Track routing savings if optimal route was used
+        (if routing-used
+            (let (
+                (direct-rate (unwrap-panic (get-exchange-rate from-currency to-currency)))
+                (direct-amount (/ (* amount direct-rate) u1000000))
+                (savings (- converted-amount direct-amount))
+                (current-savings (default-to u0 (map-get? routing-savings user)))
+            )
+                (map-set routing-savings user (+ current-savings savings))
+                (map-set optimal-routes {from: from-currency, to: to-currency} (get route routing-result))
+            )
+            false
+        )
         
         ;; Update volume tracking for congestion calculation
         (map-set block-volumes current-block 
@@ -302,5 +388,41 @@
         total-volume: (var-get total-volume),
         congestion-level: (calculate-congestion-factor stacks-block-height)
     }
+)
+
+;; Get optimal routing information
+(define-read-only (get-optimal-route (from (string-ascii 5)) (to (string-ascii 5)) (amount uint))
+    (find-optimal-route from to amount)
+)
+
+;; Get routing savings for user
+(define-read-only (get-user-routing-savings (user principal))
+    (default-to u0 (map-get? routing-savings user))
+)
+
+;; Compare direct vs routed conversion
+(define-read-only (compare-conversion-methods (from (string-ascii 5)) (to (string-ascii 5)) (amount uint))
+    (let (
+        (routing-result (find-optimal-route from to amount))
+        (direct-rate (unwrap-panic (get-exchange-rate from to)))
+        (direct-amount (/ (* amount direct-rate) u1000000))
+        (optimal-amount (get amount routing-result))
+        (savings (if (> optimal-amount direct-amount) (- optimal-amount direct-amount) u0))
+        (savings-percentage (if (> direct-amount u0) (/ (* savings u10000) direct-amount) u0))
+    )
+        {
+            direct-amount: direct-amount,
+            optimal-amount: optimal-amount,
+            savings: savings,
+            savings-percentage: savings-percentage,
+            route: (get route routing-result),
+            uses-routing: (get optimal routing-result)
+        }
+    )
+)
+
+;; Get cached optimal route
+(define-read-only (get-cached-route (from (string-ascii 5)) (to (string-ascii 5)))
+    (map-get? optimal-routes {from: from, to: to})
 )
 
