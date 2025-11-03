@@ -13,6 +13,7 @@
 (define-constant ERR-ALREADY-CLAIMED (err u105))
 (define-constant ERR-INVALID-CURRENCY (err u106))
 (define-constant ERR-KYC-REQUIRED (err u107))
+(define-constant ERR-NOT-CANCELLABLE (err u108))
 
 ;; Fee optimization constants
 (define-constant BASE-FEE-RATE u250) ;; 2.5% in basis points (10000 = 100%)
@@ -311,13 +312,24 @@
     )
         (asserts! (is-eq tx-sender (get recipient remittance)) ERR-UNAUTHORIZED)
         (asserts! (is-eq (get status remittance) "PENDING") ERR-ALREADY-CLAIMED)
-        
-        ;; Update remittance status
         (map-set remittances remittance-id (merge remittance {
             status: "CLAIMED",
             claimed-at: (some current-block)
         }))
-        
+        (ok true)
+    )
+)
+
+(define-public (cancel-remittance (remittance-id uint))
+    (let (
+        (remittance (unwrap! (map-get? remittances remittance-id) ERR-REMITTANCE-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender (get sender remittance)) ERR-UNAUTHORIZED)
+        (asserts! (is-eq (get status remittance) "PENDING") ERR-NOT-CANCELLABLE)
+        (map-set remittances remittance-id (merge remittance {
+            status: "CANCELLED",
+            claimed-at: none
+        }))
         (ok true)
     )
 )
