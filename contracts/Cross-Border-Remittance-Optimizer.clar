@@ -14,6 +14,13 @@
 (define-constant ERR-INVALID-CURRENCY (err u106))
 (define-constant ERR-KYC-REQUIRED (err u107))
 (define-constant ERR-NOT-CANCELLABLE (err u108))
+(define-constant ERR-DAILY-LIMIT-EXCEEDED (err u109))
+(define-constant ERR-WEEKLY-LIMIT-EXCEEDED (err u110))
+
+(define-constant DEFAULT-DAILY-LIMIT u10000000000)
+(define-constant DEFAULT-WEEKLY-LIMIT u50000000000)
+(define-constant BLOCKS-PER-DAY u144)
+(define-constant BLOCKS-PER-WEEK u1008)
 
 ;; Fee optimization constants
 (define-constant BASE-FEE-RATE u250) ;; 2.5% in basis points (10000 = 100%)
@@ -65,6 +72,18 @@
 ;; Routing optimization tracking
 (define-map routing-savings principal uint)
 (define-map optimal-routes {from: (string-ascii 5), to: (string-ascii 5)} (list 3 (string-ascii 5)))
+
+(define-map user-transfer-limits principal {
+    daily-limit: uint,
+    weekly-limit: uint
+})
+
+(define-map user-transfer-history principal {
+    daily-total: uint,
+    daily-reset-block: uint,
+    weekly-total: uint,
+    weekly-reset-block: uint
+})
 
 ;; Exchange rate helpers
 (define-private (get-exchange-rate (from (string-ascii 5)) (to (string-ascii 5)))
@@ -194,6 +213,54 @@
         best)
 )
 
+(define-private (get-user-limits (user principal))
+    (default-to {daily-limit: DEFAULT-DAILY-LIMIT, weekly-limit: DEFAULT-WEEKLY-LIMIT}
+                (map-get? user-transfer-limits user))
+)
+
+(define-private (get-transfer-history (user principal))
+    (default-to {daily-total: u0, daily-reset-block: u0, weekly-total: u0, weekly-reset-block: u0}
+                (map-get? user-transfer-history user))
+)
+
+(define-private (check-transfer-limits (user principal) (amount uint))
+    (let (
+        (limits (get-user-limits user))
+        (history (get-transfer-history user))
+        (current-block stacks-block-height)
+        (daily-reset-needed (> (- current-block (get daily-reset-block history)) BLOCKS-PER-DAY))
+        (weekly-reset-needed (> (- current-block (get weekly-reset-block history)) BLOCKS-PER-WEEK))
+        (current-daily (if daily-reset-needed u0 (get daily-total history)))
+        (current-weekly (if weekly-reset-needed u0 (get weekly-total history)))
+    )
+        (if (> (+ current-daily amount) (get daily-limit limits))
+            (err u109)
+            (if (> (+ current-weekly amount) (get weekly-limit limits))
+                (err u110)
+                (ok true)))
+    )
+)
+
+(define-private (update-transfer-history (user principal) (amount uint))
+    (let (
+        (history (get-transfer-history user))
+        (current-block stacks-block-height)
+        (daily-reset-needed (> (- current-block (get daily-reset-block history)) BLOCKS-PER-DAY))
+        (weekly-reset-needed (> (- current-block (get weekly-reset-block history)) BLOCKS-PER-WEEK))
+        (new-daily-total (if daily-reset-needed amount (+ (get daily-total history) amount)))
+        (new-weekly-total (if weekly-reset-needed amount (+ (get weekly-total history) amount)))
+        (new-daily-reset (if daily-reset-needed current-block (get daily-reset-block history)))
+        (new-weekly-reset (if weekly-reset-needed current-block (get weekly-reset-block history)))
+    )
+        (map-set user-transfer-history user {
+            daily-total: new-daily-total,
+            daily-reset-block: new-daily-reset,
+            weekly-total: new-weekly-total,
+            weekly-reset-block: new-weekly-reset
+        })
+    )
+)
+
 ;; Get route path based on best conversion
 (define-private (get-route-path (from (string-ascii 5)) (to (string-ascii 5)) (routed-amount uint) (direct-amount uint))
     (let (
@@ -250,8 +317,10 @@
         (asserts! (get registered user-data) ERR-USER-NOT-REGISTERED)
         (asserts! (get kyc-verified user-data) ERR-KYC-REQUIRED)
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (try! (check-transfer-limits user amount))
         
-        ;; Update remittance counter
+        (update-transfer-history user amount)
+        
         (var-set remittance-counter remittance-id)
         
         ;; Update user stats
@@ -334,7 +403,18 @@
     )
 )
 
-;; Admin function to update exchange rates
+(define-public (set-user-transfer-limits (user principal) (daily-limit uint) (weekly-limit uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (<= daily-limit weekly-limit) ERR-INVALID-AMOUNT)
+        (map-set user-transfer-limits user {
+            daily-limit: daily-limit,
+            weekly-limit: weekly-limit
+        })
+        (ok true)
+    )
+)
+
 (define-public (set-exchange-rate (from (string-ascii 5)) (to (string-ascii 5)) (rate uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
@@ -433,8 +513,32 @@
     )
 )
 
-;; Get cached optimal route
 (define-read-only (get-cached-route (from (string-ascii 5)) (to (string-ascii 5)))
     (map-get? optimal-routes {from: from, to: to})
+)
+
+(define-read-only (get-remaining-limits (user principal))
+    (let (
+        (limits (get-user-limits user))
+        (history (get-transfer-history user))
+        (current-block stacks-block-height)
+        (daily-reset-needed (> (- current-block (get daily-reset-block history)) BLOCKS-PER-DAY))
+        (weekly-reset-needed (> (- current-block (get weekly-reset-block history)) BLOCKS-PER-WEEK))
+        (current-daily (if daily-reset-needed u0 (get daily-total history)))
+        (current-weekly (if weekly-reset-needed u0 (get weekly-total history)))
+        (daily-remaining (- (get daily-limit limits) current-daily))
+        (weekly-remaining (- (get weekly-limit limits) current-weekly))
+    )
+        {
+            daily-limit: (get daily-limit limits),
+            weekly-limit: (get weekly-limit limits),
+            daily-used: current-daily,
+            weekly-used: current-weekly,
+            daily-remaining: daily-remaining,
+            weekly-remaining: weekly-remaining,
+            blocks-until-daily-reset: (if daily-reset-needed u0 (- BLOCKS-PER-DAY (- current-block (get daily-reset-block history)))),
+            blocks-until-weekly-reset: (if weekly-reset-needed u0 (- BLOCKS-PER-WEEK (- current-block (get weekly-reset-block history))))
+        }
+    )
 )
 
