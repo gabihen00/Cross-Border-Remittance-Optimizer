@@ -16,6 +16,9 @@
 (define-constant ERR-NOT-CANCELLABLE (err u108))
 (define-constant ERR-DAILY-LIMIT-EXCEEDED (err u109))
 (define-constant ERR-WEEKLY-LIMIT-EXCEEDED (err u110))
+(define-constant ERR-BENEFICIARY-EXISTS (err u111))
+(define-constant ERR-BENEFICIARY-NOT-FOUND (err u112))
+(define-constant ERR-MAX-BENEFICIARIES (err u113))
 
 (define-constant DEFAULT-DAILY-LIMIT u10000000000)
 (define-constant DEFAULT-WEEKLY-LIMIT u50000000000)
@@ -33,6 +36,8 @@
 ;; Routing optimization constants
 (define-constant MIN-SAVINGS-THRESHOLD u100) ;; 1% minimum savings to use routing (in basis points)
 (define-constant MAX-ROUTE-STEPS u3) ;; Maximum steps in routing path
+(define-constant MAX-BENEFICIARIES u10)
+(define-constant TRUSTED-FEE-DISCOUNT u10)
 
 ;; Data Variables
 (define-data-var remittance-counter uint u0)
@@ -84,6 +89,13 @@
     weekly-total: uint,
     weekly-reset-block: uint
 })
+
+(define-map trusted-beneficiaries {sender: principal, recipient: principal} {
+    added-at: uint,
+    total-transfers: uint
+})
+
+(define-map beneficiary-count principal uint)
 
 ;; Exchange rate helpers
 (define-private (get-exchange-rate (from (string-ascii 5)) (to (string-ascii 5)))
@@ -312,6 +324,8 @@
         (converted-amount (get amount routing-result))
         (routing-used (get optimal routing-result))
         (fee (calculate-dynamic-fee amount user))
+        (is-trusted (is-some (map-get? trusted-beneficiaries {sender: user, recipient: recipient})))
+        (adjusted-fee (if is-trusted (- fee (/ (* fee TRUSTED-FEE-DISCOUNT) u100)) fee))
         (remittance-id (+ (var-get remittance-counter) u1))
     )
         (asserts! (get registered user-data) ERR-USER-NOT-REGISTERED)
@@ -344,7 +358,7 @@
             to-currency: to-currency,
             amount: amount,
             converted-amount: converted-amount,
-            fee: fee,
+            fee: adjusted-fee,
             status: "PENDING",
             created-at: current-block,
             claimed-at: none
@@ -368,6 +382,16 @@
         (map-set block-volumes current-block 
                  (+ (default-to u0 (map-get? block-volumes current-block)) amount))
         (var-set total-volume (+ (var-get total-volume) amount))
+
+        (if is-trusted
+            (let (
+                (ben-data (unwrap-panic (map-get? trusted-beneficiaries {sender: user, recipient: recipient})))
+            )
+                (map-set trusted-beneficiaries {sender: user, recipient: recipient}
+                    (merge ben-data {total-transfers: (+ (get total-transfers ben-data) u1)}))
+            )
+            false
+        )
         
         (ok remittance-id)
     )
@@ -425,6 +449,36 @@
                 (if (and (is-eq from "EUR") (is-eq to "GBP"))
                     (var-set eur-gbp-rate rate)
                     false)))
+        (ok true)
+    )
+)
+
+(define-public (add-trusted-beneficiary (recipient principal))
+    (let (
+        (user tx-sender)
+        (user-data (unwrap! (map-get? users user) ERR-USER-NOT-REGISTERED))
+        (current-count (default-to u0 (map-get? beneficiary-count user)))
+    )
+        (asserts! (get registered user-data) ERR-USER-NOT-REGISTERED)
+        (asserts! (is-none (map-get? trusted-beneficiaries {sender: user, recipient: recipient})) ERR-BENEFICIARY-EXISTS)
+        (asserts! (< current-count MAX-BENEFICIARIES) ERR-MAX-BENEFICIARIES)
+        (map-set trusted-beneficiaries {sender: user, recipient: recipient} {
+            added-at: stacks-block-height,
+            total-transfers: u0
+        })
+        (map-set beneficiary-count user (+ current-count u1))
+        (ok true)
+    )
+)
+
+(define-public (remove-trusted-beneficiary (recipient principal))
+    (let (
+        (user tx-sender)
+        (current-count (default-to u0 (map-get? beneficiary-count user)))
+    )
+        (asserts! (is-some (map-get? trusted-beneficiaries {sender: user, recipient: recipient})) ERR-BENEFICIARY-NOT-FOUND)
+        (map-delete trusted-beneficiaries {sender: user, recipient: recipient})
+        (map-set beneficiary-count user (if (> current-count u0) (- current-count u1) u0))
         (ok true)
     )
 )
@@ -515,6 +569,18 @@
 
 (define-read-only (get-cached-route (from (string-ascii 5)) (to (string-ascii 5)))
     (map-get? optimal-routes {from: from, to: to})
+)
+
+(define-read-only (is-trusted-beneficiary (sender principal) (recipient principal))
+    (is-some (map-get? trusted-beneficiaries {sender: sender, recipient: recipient}))
+)
+
+(define-read-only (get-beneficiary-details (sender principal) (recipient principal))
+    (map-get? trusted-beneficiaries {sender: sender, recipient: recipient})
+)
+
+(define-read-only (get-beneficiary-count (user principal))
+    (default-to u0 (map-get? beneficiary-count user))
 )
 
 (define-read-only (get-remaining-limits (user principal))
